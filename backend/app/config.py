@@ -11,11 +11,11 @@ class Settings(BaseSettings):
     api_title: str = "DGTAX QnA API"
     api_version: str = "0.1.0"
 
-    ollama_base_url: str = "http://caitanserver:5010"
+    ollama_base_url: str = "http://186.207.189.218:5010"
     ollama_model: str = "llama3"
     ollama_timeout_seconds: int = 120
 
-    postgres_host: str = "caitanserver"
+    postgres_host: str = "186.207.189.218"
     postgres_port: int = 5432
     postgres_database: str = "dgtax"
     postgres_user: str = "admin"

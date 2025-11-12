@@ -20,6 +20,7 @@ class OllamaClient:
         self._model = model
         self._timeout = timeout
         self._client: Optional[httpx.AsyncClient] = None
+        self._error_history: list[str] = []  # Histórico de erros para retry
 
     async def start(self) -> None:
         if self._client is None:
@@ -51,20 +52,79 @@ class OllamaClient:
         data = response.json()
         return data["message"]["content"]
 
-    async def plan_query(self, pergunta: str, limite_padrao: int) -> QueryIntent:
+    async def register_error(self, error_message: str) -> None:
+        """Registra um erro de execução SQL para feedback na próxima tentativa."""
+        self._error_history.append(error_message)
+
+    def _clear_error_history(self) -> None:
+        """Limpa o histórico de erros (chamado após sucesso)."""
+        self._error_history.clear()
+
+    def _clean_malformed_json(self, content: str) -> str:
+        """
+        Limpa JSON malformado removendo quebras de linha excessivas e espaços dentro de strings.
+        Tenta corrigir problemas comuns de formatação da IA.
+        """
+        import re
+        
+        # Remove múltiplas quebras de linha consecutivas dentro de strings JSON
+        # Padrão: "sql": "WITH cte AS (\n\n\n..." -> "sql": "WITH cte AS (..."
+        content = re.sub(r'\\n\s*\\n+', r' ', content)
+        
+        # Remove tabs e espaços excessivos dentro de strings SQL
+        content = re.sub(r'\\t+', r' ', content)
+        content = re.sub(r'\s{2,}', r' ', content)
+        
+        return content.strip()
+
+    async def plan_query(self, pergunta: str, limite_padrao: int, attempt: int = 0) -> QueryIntent:
         system_prompt = SQL_PLANNER_SYSTEM_PROMPT.replace("%(limite_padrao)s", str(limite_padrao))
-        content = await self.chat(
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": pergunta},
-            ],
-            json_mode=True,
-        )
+        
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        # Se houver erros anteriores, adiciona contexto de correção
+        if self._error_history:
+            error_context = "\n\n".join([
+                f"ERRO NA TENTATIVA ANTERIOR {i+1}: {err}" 
+                for i, err in enumerate(self._error_history)
+            ])
+            user_message = (
+                f"ATENÇÃO: As tentativas anteriores geraram erros SQL. Corrija os problemas identificados.\n\n"
+                f"{error_context}\n\n"
+                f"Analise os erros acima e gere uma consulta SQL CORRIGIDA para a pergunta:\n"
+                f"{pergunta}\n\n"
+                "Retorne EXATAMENTE um objeto JSON seguindo o formato especificado. "
+                "Não adicione texto extra, nem comentários, nem blocos de código."
+            )
+        else:
+            user_message = (
+                "Retorne EXATAMENTE um objeto JSON seguindo o formato especificado. "
+                "Não adicione texto extra, nem comentários, nem blocos de código. "
+                "Pergunta do usuário:\n"
+                f"{pergunta}"
+            )
+        
+        messages.append({"role": "user", "content": user_message})
+        
+        content = await self.chat(messages, json_mode=True)
+
+        # Limpa JSON malformado (remove quebras de linha excessivas dentro de strings)
+        content = self._clean_malformed_json(content)
 
         try:
             payload: Dict[str, Any] = json.loads(content)
         except json.JSONDecodeError as exc:
-            raise LLMResponseFormatError("Resposta da IA (planejamento) não é um JSON válido.") from exc
+            # Se ainda falhar após limpeza, tenta novamente com feedback
+            if attempt < 2:  # Máximo 2 tentativas de limpeza
+                await self.register_error(
+                    f"JSON malformado retornado. Erro: {str(exc)}. "
+                    "IMPORTANTE: Retorne JSON valido em UMA UNICA LINHA, sem quebras de linha dentro do SQL."
+                )
+                return await self.plan_query(pergunta, limite_padrao, attempt + 1)
+            
+            raise LLMResponseFormatError(
+                f"Resposta da IA (planejamento) não é um JSON válido. Conteúdo truncado: {content[:200]!r}"
+            ) from exc
 
         return QueryIntent(
             sql=payload.get("sql") or "",
@@ -86,6 +146,7 @@ class OllamaClient:
                 "avisos": avisos,
             },
             ensure_ascii=False,
+            default=str,
         )
 
         content = await self.chat(

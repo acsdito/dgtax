@@ -4,3 +4,4 @@ httpx==0.27.2
 psycopg[binary]==3.2.1
 pydantic-settings==2.5.2
 sqlparse==0.5.1
+pdfplumber==0.11.4
